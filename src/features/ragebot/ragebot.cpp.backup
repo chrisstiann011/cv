@@ -1,0 +1,1398 @@
+#include "Ragebot.h"
+#include "../threading/Threader.h"
+
+constexpr Vector vWorldUpVector = Vector( 0, 0, 1 ); // trust me, this is saving about 15 picoseconds
+
+
+using namespace NRagebot;
+
+static const std::vector<Vector> capsule_points = {
+	{ 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, -1.0f },
+	{ 0.0f, 1.0f, 0.0f }, { 0.0f, -1.0f, 0.0f }, { 1.0f, 0.0f, 0.0f },
+	{ -1.0f, 0.0f, 0.0f }, { 0.5f, 0.5f, 0.5f }, { -0.5f, 0.5f, 0.5f },
+	{ 0.5f, -0.5f, 0.5f }, { 0.5f, 0.5f, -0.5f }, { -0.5f, -0.5f, 0.5f },
+	{ -0.5f, 0.5f, -0.5f }, { 0.5f, -0.5f, -0.5f }, { -0.5f, -0.5f, -0.5f },
+	{ 0.707f, 0.707f, 0.0f }, { -0.707f, 0.707f, 0.0f }, { 0.707f, -0.707f, 0.0f },
+	{ -0.707f, -0.707f, 0.0f }, { 0.707f, 0.0f, 0.707f }, { -0.707f, 0.0f, 0.707f },
+	{ 0.707f, 0.0f, -0.707f }, { -0.707f, 0.0f, -0.707f }, { 0.0f, 0.707f, 0.707f },
+	{ 0.0f, -0.707f, 0.707f }, { 0.0f, 0.707f, -0.707f }, { 0.0f, -0.707f, -0.707f },
+	{ 0.0f, 0.0f, 0.5f }, { 0.0f, 0.0f, -0.5f }, { 0.0f, 0.5f, 0.0f },
+	{ 0.0f, -0.5f, 0.0f }, { 0.5f, 0.0f, 0.0f }, { -0.5f, 0.0f, 0.0f },
+	{ 0.35f, 0.35f, 0.0f }, { -0.35f, 0.35f, 0.0f }, { 0.35f, -0.35f, 0.0f },
+	{ -0.35f, -0.35f, 0.0f }, { 0.35f, 0.0f, 0.35f }, { -0.35f, 0.0f, 0.35f },
+	{ 0.35f, 0.0f, -0.35f }, { -0.35f, 0.0f, -0.35f }, { 0.0f, 0.35f, 0.35f },
+	{ 0.0f, -0.35f, 0.35f }, { 0.0f, 0.35f, -0.35f }, { 0.0f, -0.35f, -0.35f }
+};
+
+static float CalculateDynamicPointScale(const Vector& point, const Vector& shoot_pos, const HitboxData_t& hitbox, float spread) {
+	float distance = (point - shoot_pos).Length();
+	float effective_spread = spread * distance;
+	float adjusted_radius = std::max(hitbox.m_flRadius - effective_spread * 0.3f, hitbox.m_flRadius * 0.1f);
+	return std::clamp(adjusted_radius / hitbox.m_flRadius, 0.0f, 1.0f) * 100.0f;
+}
+
+std::vector<Vector> CMultipointManager::HeadPoints(HitboxData_t hitbox) {
+	if (!LocalPlayerData::m_pWeapon || hitbox.m_flRadius <= 0.001f || !hitbox.m_vCenter.IsValid()) 
+		return { hitbox.m_vCenter };
+
+	try {
+		std::vector<Vector> points;
+		float spread = LocalPlayerData::m_pWeapon->GetSpread() + LocalPlayerData::m_pWeapon->GetInaccuracy().flTotalInaccuracy;
+		
+		// Use head pointscale for head hitbox, body pointscale for everything else
+		bool bIsHead = (hitbox.m_nHitboxIndex == HITBOX_HEAD);
+		int point_scale = bIsHead ? g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleHead : g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleBody;
+		
+		if (point_scale <= 0)
+			point_scale = static_cast<int>(CalculateDynamicPointScale(hitbox.m_vCenter, m_vExtrapShootPos, hitbox, spread));
+
+		float final_radius = hitbox.m_flRadius * (point_scale / 100.0f);
+		if (!std::isfinite(final_radius) || final_radius <= 0.001f) 
+			return { hitbox.m_vCenter };
+
+		if (final_radius / hitbox.m_flRadius < 0.2f) {
+			points.push_back(hitbox.m_vCenter);
+			return points;
+		}
+
+		Vector length = hitbox.m_vMaxs - hitbox.m_vMins;
+		float len_dist = length.Length();
+		if (len_dist < 0.001f) {
+			points.push_back(hitbox.m_vCenter);
+			return points;
+		}
+
+		Vector capsule_core_normal = length;
+		capsule_core_normal.NormalizeInPlace();
+		if (!capsule_core_normal.IsValid()) 
+			capsule_core_normal = Vector(0, 0, 1);
+
+		Matrix3x4_t capsule_space = Math::CreateRotationMatrixFromVector(capsule_core_normal);
+
+		for (size_t i = 0; i < capsule_points.size(); i++) {
+			Vector capsule_vert = capsule_points[i];
+			capsule_vert = Math::RotateVectorByMatrix(capsule_vert, capsule_space);
+			capsule_vert *= final_radius;
+			if (capsule_points[i].z > 0.0f) 
+				capsule_vert += length;
+
+			Vector final_point = hitbox.m_vMins + capsule_vert;
+			if (final_point.IsValid()) 
+				points.push_back(final_point);
+		}
+		points.push_back(hitbox.m_vCenter);
+		return points;
+	}
+	catch (...) { 
+		return { hitbox.m_vCenter }; 
+	}
+}
+
+std::vector<Vector> CMultipointManager::MinimalPoints(HitboxData_t hitbox) {
+	if (!LocalPlayerData::m_pWeapon || hitbox.m_flRadius <= 0.001f || !hitbox.m_vCenter.IsValid()) 
+		return { hitbox.m_vCenter };
+
+	try {
+		std::vector<Vector> points;
+		float spread = LocalPlayerData::m_pWeapon->GetSpread() + LocalPlayerData::m_pWeapon->GetInaccuracy().flTotalInaccuracy;
+		
+		// Use head pointscale for head hitbox, body pointscale for everything else
+		bool bIsHead = (hitbox.m_nHitboxIndex == HITBOX_HEAD);
+		int point_scale = bIsHead ? g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleHead : g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleBody;
+		
+		if (point_scale <= 0)
+			point_scale = static_cast<int>(CalculateDynamicPointScale(hitbox.m_vCenter, m_vExtrapShootPos, hitbox, spread));
+
+		float final_radius = hitbox.m_flRadius * (point_scale / 100.0f);
+		if (!std::isfinite(final_radius) || final_radius <= 0.001f) 
+			return { hitbox.m_vCenter };
+
+		Vector length = hitbox.m_vMaxs - hitbox.m_vMins;
+		if (length.Length() < 0.001f) {
+			points.push_back(hitbox.m_vCenter);
+			return points;
+		}
+
+		Vector capsule_core_normal = length;
+		capsule_core_normal.NormalizeInPlace();
+		if (!capsule_core_normal.IsValid()) 
+			capsule_core_normal = Vector(0, 0, 1);
+
+		Matrix3x4_t capsule_space = Math::CreateRotationMatrixFromVector(capsule_core_normal);
+
+		for (int i = 0; i < 5; i++) {
+			Vector target_point;
+			if (i == 0) {
+				target_point = hitbox.m_vCenter;
+				points.push_back(target_point);
+				continue;
+			}
+			else if (i == 1) target_point = Vector(0.0f, 0.0f, 1.0f);
+			else if (i == 2) target_point = Vector(0.0f, 0.0f, -1.0f);
+			else if (i == 3) target_point = Vector(0.0f, 1.0f, 0.0f);
+			else target_point = Vector(0.0f, -1.0f, 0.0f);
+
+			Vector capsule_vert = target_point;
+			capsule_vert = Math::RotateVectorByMatrix(capsule_vert, capsule_space);
+			capsule_vert *= final_radius;
+			if (target_point.z > 0.0f || target_point.y > 0.0f) 
+				capsule_vert += length;
+
+			Vector final_point = hitbox.m_vMins + capsule_vert;
+			if (final_point.IsValid()) 
+				points.push_back(final_point);
+		}
+		return points;
+	}
+	catch (...) { 
+		return { hitbox.m_vCenter }; 
+	}
+}
+
+std::vector<Vector> CMultipointManager::GetMultiPoints(HitboxData_t hitbox) {
+	switch (hitbox.m_nHitboxIndex) {
+	case HITBOX_HEAD: 
+	case HITBOX_NECK: 
+		return HeadPoints(hitbox);
+	case HITBOX_STOMACH: 
+	case HITBOX_UPPER_CHEST: 
+	case HITBOX_CHEST:
+	case HITBOX_PELVIS: 
+	case HITBOX_RIGHT_HAND:
+	case HITBOX_LEFT_HAND: 
+	case HITBOX_RIGHT_FOREARM: 
+	case HITBOX_LEFT_FOREARM:
+	case HITBOX_RIGHT_UPPER_ARM: 
+	case HITBOX_LEFT_UPPER_ARM: 
+	case HITBOX_RIGHT_THIGH:
+	case HITBOX_LEFT_THIGH: 
+	case HITBOX_RIGHT_CALF: 
+	case HITBOX_LEFT_CALF:
+	case HITBOX_RIGHT_FOOT: 
+	case HITBOX_LEFT_FOOT: 
+		return MinimalPoints(hitbox);
+	default: 
+		return { hitbox.m_vCenter };
+	}
+}
+
+bool CMultipointManager::ShouldUseMultipoint(int nHitboxIndex) {
+	const auto& hitboxes = g_Variables.m_Ragebot.m_ActiveConfig.m_Hitboxes;
+
+	auto GetMultipointState = [&](EConfigHitBoxes hitboxType) -> bool {
+		for (const auto& hitbox : hitboxes) {
+			if (hitbox.m_eDefinition == hitboxType) {
+				return hitbox.m_bMultipoint;
+			}
+		}
+		return false;
+		};
+
+	switch (nHitboxIndex) {
+	case HITBOX_HEAD:
+		return GetMultipointState(HB_HEAD);
+	case HITBOX_UPPER_CHEST:
+	case HITBOX_CHEST:
+		return GetMultipointState(HB_CHEST);
+	case HITBOX_STOMACH:
+	case HITBOX_PELVIS:
+		return GetMultipointState(HB_STOMACH);
+	case HITBOX_RIGHT_HAND:
+	case HITBOX_LEFT_HAND:
+	case HITBOX_RIGHT_FOREARM:
+	case HITBOX_LEFT_FOREARM:
+	case HITBOX_RIGHT_UPPER_ARM:
+	case HITBOX_LEFT_UPPER_ARM:
+		return GetMultipointState(HB_ARMS);
+	case HITBOX_RIGHT_THIGH:
+	case HITBOX_LEFT_THIGH:
+	case HITBOX_RIGHT_CALF:
+	case HITBOX_LEFT_CALF:
+	case HITBOX_RIGHT_FOOT:
+	case HITBOX_LEFT_FOOT:
+		return GetMultipointState(HB_LEGS);
+	default:
+		return false;
+	}
+}
+
+std::vector<Vector> CMultipointManager::GenerateMultipoints(HitboxData_t hitbox) {
+	if (!ShouldUseMultipoint(hitbox.m_nHitboxIndex)) {
+		return { hitbox.m_vCenter };
+	}
+
+	return GetMultiPoints(hitbox);
+}
+
+
+void CAccuracy::CacheSpreadTable( )
+{
+
+}
+
+float SpeedRatioCalc( float flCurrentSpeed2D, float flAccurateSpeed, float flAdjustedFullSpeed )
+{
+	float v6 = flCurrentSpeed2D - flAccurateSpeed;
+	float v7 = flAdjustedFullSpeed - flAccurateSpeed;
+
+	float v9 = v6 / v7;
+	return std::clamp( v9, 0.0f, 1.0f );
+}
+
+
+bool CAccuracy::HasMaximumAccuracy()
+{
+	CONVAR(weapon_accuracy_nospread);
+
+	if (weapon_accuracy_nospread->GetBool())
+		return true;
+
+	if (!Globals::m_pLocalPlayerPawn || !Globals::m_pLocalPlayerPawn->m_pCameraServices())
+		return false;
+
+	else if (LocalPlayerData::m_nWeaponDefinitionIndex == WEAPON_SSG_08 || LocalPlayerData::m_nWeaponDefinitionIndex == WEAPON_AWP || LocalPlayerData::m_nWeaponDefinitionIndex == WEAPON_SCAR_20 || LocalPlayerData::m_nWeaponDefinitionIndex == WEAPON_G3SG1) {
+
+		Vector vCam = Globals::m_pLocalPlayerPawn->m_pCameraServices()->m_vClientScopeInaccuracy();
+
+		if (vCam.x <= 1e-6f)
+			vCam.x = 0.f;
+
+		switch (LocalPlayerData::m_nWeaponDefinitionIndex) {
+		case WEAPON_SSG_08:
+			return vCam.x <= 0.00089f;
+		case WEAPON_AWP:
+			return vCam.x <= 0.0005f;
+		case WEAPON_SCAR_20:
+		case WEAPON_G3SG1:
+			return vCam.x <= 0.0012f;
+		default:
+			return vCam.x <= 0.00089f;
+		}
+	}
+	
+	return false;
+}
+
+// Функция для проверки точности оружия (адаптирована из форсшута)
+bool IsWeaponAccurate() {
+	if (!LocalPlayerData::m_pWeapon || !Globals::m_pLocalPlayerPawn)
+		return false;
+
+	// Обновляем штраф за точность
+	LocalPlayerData::m_pWeapon->UpdateAccuracyPenalty();
+	
+	// Получаем общую неточность
+	float flInaccuracy = LocalPlayerData::m_pWeapon->GetInaccuracy().flTotalInaccuracy;
+	
+	// Проверяем точность (адаптированный порог из форсшута)
+	return flInaccuracy <= 0.005f; // Немного увеличили порог для автостопов
+}
+
+//bool CAccuracy::ShouldForceShot()
+//{
+//	if (!Config::b(g_Variables.m_Ragebot.m_bForceShot))
+//		return false;
+//
+//	if (!LocalPlayerData::m_pWeapon)
+//		return false;
+//
+//	if (!Globals::m_pLocalPlayerPawn)
+//		return false;
+//
+//	// Update accuracy penalty before checking inaccuracy
+//	LocalPlayerData::m_pWeapon->UpdateAccuracyPenalty();
+//
+//	// Get total inaccuracy
+//	float flInaccuracy = LocalPlayerData::m_pWeapon->GetInaccuracy().flTotalInaccuracy;
+//
+//#ifdef DEBUG_CONSOLE
+//	if (flInaccuracy <= 0.003f) {
+//		Logging::Print(X("[ForceShot] Inaccuracy: {:.6f} - FORCING SHOT"), flInaccuracy);
+//	}
+//#endif
+//
+//	// Force shot if inaccuracy is low enough (very accurate)
+//	return flInaccuracy <= 0.003f;
+//}
+
+
+static std::vector<Vector> CalculateSpreadInternal( int seed, float accuracy, float spread, float recoil_index, int item_def_idx, int num_bullets )
+{
+	std::vector<Vector> spread_results( num_bullets );
+	static auto fnCalcSpread = reinterpret_cast<void( __fastcall* )( int16_t, int, int, std::uint32_t, float, float, float, float*, float* )>( Memory::FindPattern( CLIENT_DLL, X( "48 8B C4 48 89 58 ? 48 89 68 ? 48 89 70 ? 57 41 54 41 55 41 56 41 57 48 81 EC ? ? ? ? 4C 63 EA" ) ) );
+	fnCalcSpread(
+		item_def_idx,
+		num_bullets,
+		0,
+		seed + 1,
+		accuracy,
+		spread,
+		recoil_index,
+		reinterpret_cast<float*>( &spread_results[ 0 ].x ),
+		reinterpret_cast<float*>( &spread_results[ 0 ].y )
+	);
+
+	return spread_results;
+}
+
+float ForceShoot(const Vector& vShootPos, const Vector& vTargetPoint, const HitboxData_t& hitbox, float flConfigHitChance) {
+	if (flConfigHitChance <= 0.f)
+		return 0.f;
+
+	if (flConfigHitChance >= 100.f)
+		return 100.f;
+
+	float flMaxHitChance = flConfigHitChance;
+	float flDistanceFactor = 1.0f;
+	float flAngleFactor = 1.0f;
+	float flHitboxFactor = 1.0f;
+	float flVelocityFactor = 1.0f;
+
+	float flDistance = vShootPos.DistTo(vTargetPoint);
+	if (flDistance > 1000.f) {
+		flDistanceFactor = std::max(0.3f, 1.0f - (flDistance - 1000.f) / 2000.f);
+	}
+	else if (flDistance < 200.f) {
+		flDistanceFactor = 1.1f;
+	}
+
+	Vector vDirection = (vTargetPoint - vShootPos).Normalized();
+	Vector vForward, vRight, vUp;
+	Interfaces::m_pInput->GetViewAngles().ToDirections(&vForward, &vRight, &vUp);
+
+	float flDotForward = vDirection.DotProduct(vForward);
+	float flDotRight = vDirection.DotProduct(vRight);
+	float flDotUp = vDirection.DotProduct(vUp);
+
+	if (flDotForward > 0.95f) {
+		flAngleFactor = 1.0f;
+	}
+	else if (std::abs(flDotRight) > 0.5f || std::abs(flDotUp) > 0.3f) {
+		flAngleFactor = 0.7f;
+	}
+	else if (flDotForward < 0.0f) {
+		flAngleFactor = 0.3f;
+	}
+
+	switch (hitbox.m_nHitboxIndex) {
+	case HITBOX_HEAD:
+		flHitboxFactor = 0.8f;
+		break;
+	case HITBOX_CHEST:
+	case HITBOX_UPPER_CHEST:
+		flHitboxFactor = 1.0f;
+		break;
+	case HITBOX_STOMACH:
+		flHitboxFactor = 1.1f;
+		break;
+	case HITBOX_PELVIS:
+		flHitboxFactor = 1.2f;
+		break;
+	case HITBOX_LEFT_UPPER_ARM:
+	case HITBOX_RIGHT_UPPER_ARM:
+	case HITBOX_LEFT_FOREARM:
+	case HITBOX_RIGHT_FOREARM:
+		flHitboxFactor = 0.9f;
+		break;
+	case HITBOX_LEFT_THIGH:
+	case HITBOX_RIGHT_THIGH:
+	case HITBOX_LEFT_CALF:
+	case HITBOX_RIGHT_CALF:
+		flHitboxFactor = 0.8f;
+		break;
+	default:
+		flHitboxFactor = 1.0f;
+		break;
+	}
+
+	if (g_Rage->m_Data.m_LastTarget.m_pLagRecord && Input::HandleInput(Config::kb(g_Variables.m_Ragebot.m_iMinDamageOverrideKey))) {
+		float flTargetSpeed = g_Rage->m_Data.m_LastTarget.m_pLagRecord->m_pPawn->m_vecVelocity().Length2D();
+		if (flTargetSpeed > 100.f) {
+			flVelocityFactor = std::max(0.4f, 1.0f - (flTargetSpeed - 100.f) / 300.f);
+		}
+	}
+
+	float flLocalSpeed = Globals::m_pLocalPlayerPawn->m_vecAbsVelocity().Length2D();
+	if (flLocalSpeed > 50.f) {
+		flVelocityFactor *= std::max(0.5f, 1.0f - (flLocalSpeed - 50.f) / 200.f);
+	}
+
+	float flFinalHitChance = flMaxHitChance * flDistanceFactor * flAngleFactor * flHitboxFactor * flVelocityFactor;
+
+	return std::clamp(flFinalHitChance, 0.0f, flMaxHitChance);
+}
+
+bool CAccuracy::IsAccurate()
+{
+	if (!g_Rage->m_Data.m_LastTarget.HasValidTarget() || !g_Rage->m_Data.m_LastTarget.m_pLagRecord)
+		return false;
+
+	int iHitChance = m_bHoldingHitchanceOverride
+		? g_Variables.m_Ragebot.m_ActiveConfig.m_iHitchanceOverride
+		: g_Variables.m_Ragebot.m_ActiveConfig.m_iHitchance;
+
+	if (g_Rage->m_Data.m_LastTarget.HasValidTarget() && Input::HandleInput(Config::kb(g_Variables.m_Ragebot.m_iMinDamageOverrideKey))) {
+		float flDynamicHitChance = ForceShoot(
+			m_vExtrapShootPos,
+			g_Rage->m_Data.m_LastTarget.m_vPoint,
+			g_Rage->m_Data.m_LastTarget.m_hitboxData,
+			static_cast<float>(iHitChance)
+		);
+		iHitChance = static_cast<int>(flDynamicHitChance);
+	}
+
+	if (iHitChance <= 0)
+		return true;
+
+	if (g_Accuracy->HasMaximumAccuracy())
+		return true;
+
+	const float flWeaponRange = LocalPlayerData::m_pWeaponBaseVData->m_flRange();
+	if (flWeaponRange <= 0.f)
+		return false;
+
+	const float flWeaponInaccuracy = LocalPlayerData::m_pWeapon->GetInaccuracy().flTotalInaccuracy;
+	const float flWeaponSpread = LocalPlayerData::m_pWeapon->GetSpread();
+	const float flRecoilIndex = LocalPlayerData::m_pWeapon->m_flRecoilIndex();
+	const int nNumBullets = LocalPlayerData::m_pWeaponBaseVData->m_nNumBullets();
+
+	if (flWeaponInaccuracy <= 0.f && flWeaponSpread <= 0.f)
+		return true;
+
+	Vector vForward, vRight, vUp;
+	g_Rage->m_Data.m_LastTarget.m_angToTarget.ToDirections(&vForward, &vRight, &vUp);
+
+	constexpr int nWantedHitCount = 256;
+	const int nNeededHits = static_cast<int>(std::ceil(nWantedHitCount * (iHitChance / 100.f)));
+
+	if (nNeededHits <= 0)
+		return true;
+
+	if (nNeededHits > nWantedHitCount)
+		return false;
+
+	int nHits = 0;
+	const Vector& vTargetPoint = g_Rage->m_Data.m_LastTarget.m_vPoint;
+	HitboxData_t& targetHitbox = g_Rage->m_Data.m_LastTarget.m_hitboxData;
+	C_CSPlayerPawn* pTargetPawn = g_Rage->m_Data.m_LastTarget.m_pLagRecord->m_pPawn;
+
+	if (!pTargetPawn || vTargetPoint.IsZero())
+		return false;
+
+	GameTrace_t GameTrace = GameTrace_t();
+	TraceFilter_t Filter = TraceFilter_t(TRACE_MASK_AUTOWALL, Globals::m_pLocalPlayerPawn, nullptr, 4);
+	Ray_t Ray = Ray_t();
+
+	const Vector vStartPos = m_vShootPos;
+	const float flTargetDist = (vTargetPoint - vStartPos).Length();
+	const float flMaxRange = std::min(flWeaponRange, flTargetDist + 50.f);
+
+	auto fnCheckHit = [&](const Vector2D& vSpread) -> bool
+		{
+			Vector vDirection = vForward + (vRight * vSpread.x) + (vUp * vSpread.y);
+			vDirection.NormalizeInPlace();
+
+			const Vector vEnd = vStartPos + (vDirection * flMaxRange);
+
+			if (!Interfaces::m_pVPhys2World->ClipRayToEntity(&Ray, vStartPos, vEnd, pTargetPawn, &Filter, &GameTrace))
+		return false;
+
+			if (GameTrace.m_pHitEntity != pTargetPawn)
+		return false;
+
+			const Vector vHitPoint = GameTrace.m_vecEndPos;
+			const float flDistToTargetPoint = (vHitPoint - vTargetPoint).Length();
+
+			if (targetHitbox.m_nHitboxIndex >= 0 && targetHitbox.m_flRadius > 0.f)
+			{
+				if (targetHitbox.SegmentIntersectsCapsule(vStartPos, vHitPoint))
+					return true;
+
+				const float flDistToCenter = (vHitPoint - targetHitbox.m_vCenter).Length();
+				if (flDistToCenter <= targetHitbox.m_flRadius + 2.f)
+	return true;
+}
+
+			return flDistToTargetPoint < 6.f;
+		};
+
+	for (int nSeed = 0; nSeed < nWantedHitCount; nSeed++)
+	{
+		const std::vector<Vector> spreadResults = CalculateSpreadInternal(nSeed, flWeaponInaccuracy, flWeaponSpread, flRecoilIndex, LocalPlayerData::m_nWeaponDefinitionIndex, nNumBullets);
+
+		if (spreadResults.empty())
+			continue;
+
+		const Vector2D vSpread = Vector2D(spreadResults[0].x, spreadResults[0].y);
+
+		if (fnCheckHit(vSpread))
+			nHits++;
+
+		const int nRemainingSeeds = nWantedHitCount - (nSeed + 1);
+		const int nRemainingNeeded = nNeededHits - nHits;
+
+		if (nRemainingNeeded > nRemainingSeeds)
+			return false;
+
+		if (nHits >= nNeededHits)
+			return true;
+	}
+
+	const float flFinalHitChance = (static_cast<float>(nHits) / static_cast<float>(nWantedHitCount)) * 100.f;
+	return flFinalHitChance >= static_cast<float>(iHitChance);
+}
+
+bool CScan::IsBetterCandidate( ScanResult_t candidate, ScanResult_t current ) {
+
+	if ( candidate.m_flDamage <= 0 )
+		return false;
+
+	if ( current.m_flDamage <= 0 )
+		return true;
+
+	int targetingPriority = g_Variables.m_Ragebot.m_ActiveConfig.m_iTargettingType;
+	switch ( targetingPriority ) {
+	case 0:
+		return candidate.m_flDamage > current.m_flDamage;
+	case 1:
+		return candidate.m_flWorldDist < current.m_flWorldDist;
+	case 2:
+		return candidate.m_pLagRecord->m_pPawn->m_iHealth( ) < current.m_pLagRecord->m_pPawn->m_iHealth( );
+	default:
+		return candidate.m_flDamage > current.m_flDamage;
+	}
+}
+
+bool CScan::IsWithinFov(const Vector& vStartPos, const Vector& vTargetPos, const QAngle& angView, float flFovDegrees) {
+	if (flFovDegrees >= 180.0f)
+		return true;
+
+	QAngle angToTarget = Math::CalcAngle(vStartPos, vTargetPos);
+
+	angToTarget = Math::NormalizeAnglesReturn(angToTarget);
+	QAngle normalizedView = Math::NormalizeAnglesReturn(angView);
+
+	float flDeltaYaw = std::abs(angToTarget.y - normalizedView.y);
+
+	if (flDeltaYaw > 180.0f)
+		flDeltaYaw = 360.0f - flDeltaYaw;
+
+	return flDeltaYaw <= (flFovDegrees * 0.5f);
+}
+
+ScanResult_t CScan::ProcessRecord( CLagRecord* pRecord ) {
+	if (!pRecord || !pRecord->m_pPawn || !pRecord->m_pPawn->IsPlayerPawn()) 
+		return {};
+
+	if (!pRecord->m_pPawn->GetRefEHandle().IsValid()) 
+		return {};
+
+	try {
+		ScanResult_t objCandidate = {};
+		objCandidate.m_pLagRecord = pRecord;
+
+		if (!m_vExtrapShootPos.IsValid() || !pRecord->m_vOrigin.IsValid()) 
+			return {};
+
+		objCandidate.m_flWorldDist = (m_vExtrapShootPos - pRecord->m_vOrigin).Length();
+		int nPlayerHealth = pRecord->m_pPawn->m_iHealth();
+		int nConfigMinDamage = m_bHoldingMinOverride
+			? g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamageOverride
+			: g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamage;
+		
+		bool bRequireLethal = (nConfigMinDamage > 100);
+		int nDamageThreshold = bRequireLethal 
+			? nPlayerHealth  // For lethal damage, we need at least player's health
+			: nConfigMinDamage;
+		
+		objCandidate.m_flDamageThreshold = nDamageThreshold;
+
+#ifdef DEBUG_CONSOLE
+		Logging::Print(X("[MinDamage] Config: {}, Health: {}, Threshold: {}, RequireLethal: {}, Override: {}"), 
+			nConfigMinDamage, nPlayerHealth, nDamageThreshold, bRequireLethal, m_bHoldingMinOverride);
+#endif
+
+		struct PointData_t {
+			Vector m_vPoint = {};
+			float m_flDamage = 0.f;
+			HitboxData_t m_Hitbox = {};
+			bool m_bIsHead = false;
+			bool m_bIsLethal = false;
+		};
+
+		PointData_t bestHeadPoint = {};
+		PointData_t bestBodyPoint = {};
+		bool bHasHeadPoint = false;
+		bool bHasBodyPoint = false;
+
+		return pRecord->WithAppliedState([&]() -> ScanResult_t {
+			try {
+				if (pRecord->m_arrTargetHitboxes.empty()) 
+					return {};
+
+				for (const auto& hitbox : pRecord->m_arrTargetHitboxes) {
+					if (hitbox.m_flRadius <= 0.f || !std::isfinite(hitbox.m_flRadius)) 
+						continue;
+
+					bool bIsHead = (hitbox.m_nHitboxIndex == HITBOX_HEAD);
+					PointData_t bestInHitbox = {};
+					bool bTargetInAir = !(pRecord->m_pPawn->m_fFlags() & FL_ONGROUND);
+
+					GameTrace_t center_vis_trace{};
+					TraceFilter_t center_vis_filter(TRACE_MASK_VISIBLE, Globals::m_pLocalPlayerPawn, nullptr, 4);
+					Ray_t center_vis_ray{};
+
+					if (!Interfaces::m_pVPhys2World) 
+						continue;
+
+					bool bCenterVisible = Interfaces::m_pVPhys2World->ClipRayToEntity(&center_vis_ray, m_vExtrapShootPos, hitbox.m_vCenter, pRecord->m_pPawn, &center_vis_filter, &center_vis_trace)
+						&& (center_vis_trace.m_pHitEntity == pRecord->m_pPawn);
+
+					penetration_data_t center_pen_data{};
+					if (bCenterVisible && g_Autowall->m_Functions.m_FireBullet.FireBullet(m_vExtrapShootPos, hitbox.m_vCenter, &center_pen_data, pRecord->m_pPawn)) {
+						float flCenterDamage = center_pen_data.m_damage;
+						bool bIsLethal = (flCenterDamage >= nPlayerHealth);
+
+#ifdef DEBUG_CONSOLE
+						if (flCenterDamage > 0) {
+							Logging::Print(X("[Autowall] Center damage: {:.1f}, Required: {}, Health: {}, Lethal: {}, RequireLethal: {}"), 
+								flCenterDamage, nDamageThreshold, nPlayerHealth, bIsLethal, bRequireLethal);
+						}
+#endif
+
+						bool bShouldAccept = false;
+						if (bRequireLethal) {
+							// Для летального дамага (101+) - принимаем только если дамаг >= здоровья игрока
+							bShouldAccept = bIsLethal;
+						} else {
+							// Обычная логика - принимаем если дамаг >= порога
+							bShouldAccept = (flCenterDamage >= nDamageThreshold);
+						}
+						
+						if (bShouldAccept) {
+							bestInHitbox = { hitbox.m_vCenter, flCenterDamage, hitbox, bIsHead, bIsLethal };
+						}
+					}
+
+					if (hitbox.m_bMultipoint && g_Points->ShouldUseMultipoint(hitbox.m_nHitboxIndex)) {
+						auto vecMultipoints = g_Points->GenerateMultipoints(hitbox);
+						// Оптимизация: меньше точек для лучшей производительности
+						int nMaxPoints = bTargetInAir ? 8 : 12; // Уменьшили количество точек
+						int nChecked = 0;
+
+						for (const auto& vMP : vecMultipoints) {
+							if (nChecked >= nMaxPoints) 
+								break;
+
+							if (!vMP.IsValid() || (vMP.x == 0.f && vMP.y == 0.f && vMP.z == 0.f)) 
+								continue;
+
+							float flMPDistance = (vMP - hitbox.m_vCenter).Length();
+							if (flMPDistance > hitbox.m_flRadius * 2.5f) // Уменьшили радиус для оптимизации
+								continue;
+
+							// Быстрая проверка видимости без полного трейса для оптимизации
+							GameTrace_t vis_trace{};
+							TraceFilter_t vis_filter(TRACE_MASK_VISIBLE, Globals::m_pLocalPlayerPawn, nullptr, 4);
+							Ray_t vis_ray{};
+
+							if (!Interfaces::m_pVPhys2World->ClipRayToEntity(&vis_ray, m_vExtrapShootPos, vMP, pRecord->m_pPawn, &vis_filter, &vis_trace))
+								continue;
+
+							if (vis_trace.m_pHitEntity != pRecord->m_pPawn) 
+								continue;
+
+							penetration_data_t pen_data_mp{};
+							if (g_Autowall->m_Functions.m_FireBullet.FireBullet(m_vExtrapShootPos, vMP, &pen_data_mp, pRecord->m_pPawn)) {
+								float flMPDamage = pen_data_mp.m_damage;
+								bool bIsLethal = (flMPDamage >= nPlayerHealth);
+
+#ifdef DEBUG_CONSOLE
+								if (flMPDamage > 0) {
+									Logging::Print(X("[Autowall] MP damage: {:.1f}, Required: {}, Health: {}, Lethal: {}, RequireLethal: {}"), 
+										flMPDamage, nDamageThreshold, nPlayerHealth, bIsLethal, bRequireLethal);
+								}
+#endif
+
+								bool bShouldAccept = false;
+								if (bRequireLethal) {
+									// Для летального дамага (101+) - принимаем только если дамаг >= здоровья игрока
+									bShouldAccept = bIsLethal;
+								} else {
+									// Обычная логика - принимаем если дамаг >= порога
+									bShouldAccept = (flMPDamage >= nDamageThreshold);
+								}
+								
+								if (bShouldAccept) {
+									if (bestInHitbox.m_flDamage == 0.f || flMPDamage > bestInHitbox.m_flDamage) {
+										bestInHitbox = { vMP, flMPDamage, hitbox, bIsHead, bIsLethal };
+									}
+								}
+							}
+							nChecked++;
+						}
+					}
+
+					if (bestInHitbox.m_flDamage > 0.f) {
+						if (bIsHead) {
+							if (!bHasHeadPoint || bestInHitbox.m_flDamage > bestHeadPoint.m_flDamage) {
+								bestHeadPoint = bestInHitbox;
+								bHasHeadPoint = true;
+							}
+						}
+						else {
+							if (!bHasBodyPoint || bestInHitbox.m_flDamage > bestBodyPoint.m_flDamage) {
+								bestBodyPoint = bestInHitbox;
+								bHasBodyPoint = true;
+							}
+						}
+					}
+				}
+
+				// Финальная проверка валидности с учетом летального дамага
+				bool bHeadValid = false;
+				bool bBodyValid = false;
+				
+				if (bHasHeadPoint) {
+					if (bRequireLethal) {
+						// Для летального дамага - только летальные выстрелы
+						bHeadValid = bestHeadPoint.m_bIsLethal;
+					} else {
+						// Обычная логика - проверяем порог дамага
+						bHeadValid = (bestHeadPoint.m_flDamage >= nDamageThreshold);
+					}
+				}
+				
+				if (bHasBodyPoint) {
+					if (bRequireLethal) {
+						// Для летального дамага - только летальные выстрелы
+						bBodyValid = bestBodyPoint.m_bIsLethal;
+					} else {
+						// Обычная логика - проверяем порог дамага
+						bBodyValid = (bestBodyPoint.m_flDamage >= nDamageThreshold);
+					}
+				}
+
+				if (bHeadValid) {
+					objCandidate.m_vPoint = bestHeadPoint.m_vPoint;
+					objCandidate.m_flDamage = bestHeadPoint.m_flDamage;
+					objCandidate.m_hitboxData = bestHeadPoint.m_Hitbox;
+
+#ifdef DEBUG_CONSOLE
+					Logging::Print(X("[Target] Selected HEAD: damage={:.1f}, lethal={}, health={}"), 
+						bestHeadPoint.m_flDamage, bestHeadPoint.m_bIsLethal, nPlayerHealth);
+#endif
+
+					if (bBodyValid) {
+						if (bestBodyPoint.m_bIsLethal && !bestHeadPoint.m_bIsLethal) {
+							objCandidate.m_vPoint = bestBodyPoint.m_vPoint;
+							objCandidate.m_flDamage = bestBodyPoint.m_flDamage;
+							objCandidate.m_hitboxData = bestBodyPoint.m_Hitbox;
+
+#ifdef DEBUG_CONSOLE
+							Logging::Print(X("[Target] Switched to BODY: damage={:.1f}, lethal={}, health={}"), 
+								bestBodyPoint.m_flDamage, bestBodyPoint.m_bIsLethal, nPlayerHealth);
+#endif
+						}
+					}
+				}
+				else if (bBodyValid) {
+					objCandidate.m_vPoint = bestBodyPoint.m_vPoint;
+					objCandidate.m_flDamage = bestBodyPoint.m_flDamage;
+					objCandidate.m_hitboxData = bestBodyPoint.m_Hitbox;
+
+#ifdef DEBUG_CONSOLE
+					Logging::Print(X("[Target] Selected BODY: damage={:.1f}, lethal={}, health={}"), 
+						bestBodyPoint.m_flDamage, bestBodyPoint.m_bIsLethal, nPlayerHealth);
+#endif
+				}
+
+				return objCandidate;
+			}
+			catch (...) { 
+				return {}; 
+			}
+		});
+	}
+	catch (...) { 
+		return {}; 
+	}
+}
+
+ScanResult_t CScan::ProcessTarget(CRecordTrack* pRecordTrack) {
+	CLagRecord* pNewestRecord = pRecordTrack->GetFirstRecord();
+	CLagRecord* pOldestRecord = pRecordTrack->GetLastRecord();
+
+	if (!pNewestRecord || !pOldestRecord)
+		return {};
+
+	const float flPositionDelta = (pNewestRecord->m_vOrigin - pOldestRecord->m_vOrigin).Length2D();
+	const bool bShouldScanBacktrack = flPositionDelta > 0.18f;
+
+	auto frontResult = this->ProcessRecord(pNewestRecord);
+
+	if (!frontResult.HasValidTarget() && bShouldScanBacktrack) {
+		return this->ProcessRecord(pOldestRecord);
+	}
+
+	return frontResult;
+}
+
+
+ScanResult_t CScan::GetBestTarget() {
+
+	std::vector<ScanResult_t> results(g_Entities->m_vecPlayersOnly.size());
+
+	std::atomic<size_t> resultIndex{ 0 };
+
+	for (size_t i = 0; i < g_Entities->m_vecPlayersOnly.size(); ++i) {
+		CRecordTrack* pTrack = g_Entities->m_vecPlayersOnly[i].GetRecordTrack();
+		if (!pTrack || !pTrack->m_bRageMatters)
+			continue;
+
+		g_Threader->EnqueueJob([this, pTrack, &results, i]() {
+			results[i] = this->ProcessTarget(pTrack);
+			});
+	}
+
+	g_Threader->WaitUntilFinished();
+
+	ScanResult_t objBestResult{};
+	for (const auto& result : results) {
+		if (g_Scan->IsBetterCandidate(result, objBestResult)) {
+			objBestResult = result;
+		}
+	}
+
+	if (objBestResult.HasValidTarget()) {
+		objBestResult.m_angToTarget = Math::CalcAngle(m_vShootPos, objBestResult.m_vPoint) - Globals::m_pLocalPlayerPawn->GetRemovedAimPunch();
+#ifdef DEBUG_CONSOLE
+		Logging::Print(X("[Ragebot] GetBestTarget: Found best target with damage: {}"), objBestResult.m_flDamage);
+#endif
+		}
+		else {
+#ifdef DEBUG_CONSOLE
+		Logging::Print(X("[Ragebot] GetBestTarget: No valid target found"));
+#endif
+	}
+
+	return objBestResult;
+}
+
+void CRage::HandleKeybinds() {
+	m_bHoldingMinOverride = Input::HandleInput(Config::kb(g_Variables.m_Ragebot.m_iMinDamageOverrideKey));
+
+	// Duck Peek - предиктивное приседание с проверкой возможности попадания
+	if (Config::b(g_Variables.m_Ragebot.m_bDuckPeek)) {
+		bool bDuckPeekPressed = Input::HandleInput(Config::kb(g_Variables.m_Ragebot.m_kbDuckPeek));
+		
+		if (bDuckPeekPressed) {
+			m_bDuckPeekActive = true;
+		} else {
+			m_bDuckPeekActive = false;
+		}
+	} else {
+		m_bDuckPeekActive = false;
+	}
+
+	static bool bLastHeadshotState = false;
+	static bool bLastBodyaimState = false;
+
+	bool bCurrentHeadshotState = Input::HandleInput(Config::kb(g_Variables.m_Ragebot.m_iMinDamageOverrideKey)); // Using same key for now
+	bool bCurrentBodyaimState = false; // Add keybind later if needed
+
+	if (bCurrentHeadshotState && !bLastHeadshotState) {
+		m_bForceHeadshot = !m_bForceHeadshot;
+		m_bForceBodyaim = false;
+#ifdef DEBUG_CONSOLE
+		Logging::Print(X("[Ragebot] Force headshot toggled: {}"), m_bForceHeadshot);
+#endif
+	}
+
+	if (bCurrentBodyaimState && !bLastBodyaimState) {
+		m_bForceBodyaim = !m_bForceBodyaim;
+		m_bForceHeadshot = false;
+#ifdef DEBUG_CONSOLE
+		Logging::Print(X("[Ragebot] Force bodyaim toggled: {}"), m_bForceBodyaim);
+#endif
+	}
+
+	bLastHeadshotState = bCurrentHeadshotState;
+	bLastBodyaimState = bCurrentBodyaimState;
+}
+
+bool CRage::SetConfig()
+{
+	if (!Config::b(g_Variables.m_Ragebot.m_bRagebotEnabled)) {
+		this->m_Data = {};
+		return false;
+	}
+
+	auto nigger = GetWeaponMenuType((EItemDefinitionIndexes)LocalPlayerData::m_nWeaponDefinitionIndex);
+	if (nigger == NONE) {
+		this->m_Data = {};
+		this->m_bBadWeapon = true;
+		return false;
+	}
+
+	if (!LocalPlayerData::m_bRageNeedsConfigUpdate) {
+		return true; // weapon didnt change . 
+	}
+	LocalPlayerData::m_bRageNeedsConfigUpdate = false; // we updated it.
+
+	switch (nigger) {
+	case LIGHT_PISTOL:
+
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iHitchance = Config::i(g_Variables.m_Ragebot.m_LIGHT_PISTOL_iHitchance);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamage = Config::i(g_Variables.m_Ragebot.m_LIGHT_PISTOL_iMinDamage);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamageOverride = Config::i(g_Variables.m_Ragebot.m_LIGHT_PISTOL_iMinDamageOverride);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_Hitboxes = Config::vhb<MenuRageHitbox_t>(g_Variables.m_Ragebot.m_LIGHT_PISTOL_vecHitBoxes);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iTargettingType = Config::i(g_Variables.m_Ragebot.m_LIGHT_PISTOL_iTargetPriority);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleHead = Config::i(g_Variables.m_Ragebot.m_LIGHT_PISTOL_iMaxPointscaleHead);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleBody = Config::i(g_Variables.m_Ragebot.m_LIGHT_PISTOL_iMaxPointscaleBody);
+		break;
+	case DEAGLE:
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iHitchance = Config::i(g_Variables.m_Ragebot.m_DEAGLE_iHitchance);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamage = Config::i(g_Variables.m_Ragebot.m_DEAGLE_iMinDamage);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamageOverride = Config::i(g_Variables.m_Ragebot.m_DEAGLE_iMinDamageOverride);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_Hitboxes = Config::vhb<MenuRageHitbox_t>(g_Variables.m_Ragebot.m_DEAGLE_vecHitBoxes);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iTargettingType = Config::i(g_Variables.m_Ragebot.m_DEAGLE_iTargetPriority);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleHead = Config::i(g_Variables.m_Ragebot.m_DEAGLE_iMaxPointscaleHead);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleBody = Config::i(g_Variables.m_Ragebot.m_DEAGLE_iMaxPointscaleBody);
+		break;
+	case REVOLVER:
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iHitchance = Config::i(g_Variables.m_Ragebot.m_REVOLVER_iHitchance);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamage = Config::i(g_Variables.m_Ragebot.m_REVOLVER_iMinDamage);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamageOverride = Config::i(g_Variables.m_Ragebot.m_REVOLVER_iMinDamageOverride);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_Hitboxes = Config::vhb<MenuRageHitbox_t>(g_Variables.m_Ragebot.m_REVOLVER_vecHitBoxes);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iTargettingType = Config::i(g_Variables.m_Ragebot.m_REVOLVER_iTargetPriority);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleHead = Config::i(g_Variables.m_Ragebot.m_REVOLVER_iMaxPointscaleHead);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleBody = Config::i(g_Variables.m_Ragebot.m_REVOLVER_iMaxPointscaleBody);
+		break;
+	case SMG:
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iHitchance = Config::i(g_Variables.m_Ragebot.m_SMG_iHitchance);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamage = Config::i(g_Variables.m_Ragebot.m_SMG_iMinDamage);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamageOverride = Config::i(g_Variables.m_Ragebot.m_SMG_iMinDamageOverride);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_Hitboxes = Config::vhb<MenuRageHitbox_t>(g_Variables.m_Ragebot.m_SMG_vecHitBoxes);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iTargettingType = Config::i(g_Variables.m_Ragebot.m_SMG_iTargetPriority);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleHead = Config::i(g_Variables.m_Ragebot.m_SMG_iMaxPointscaleHead);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleBody = Config::i(g_Variables.m_Ragebot.m_SMG_iMaxPointscaleBody);
+		break;
+	case LMG:
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iHitchance = Config::i(g_Variables.m_Ragebot.m_LMG_iHitchance);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamage = Config::i(g_Variables.m_Ragebot.m_LMG_iMinDamage);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamageOverride = Config::i(g_Variables.m_Ragebot.m_LMG_iMinDamageOverride);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_Hitboxes = Config::vhb<MenuRageHitbox_t>(g_Variables.m_Ragebot.m_LMG_vecHitBoxes);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iTargettingType = Config::i(g_Variables.m_Ragebot.m_LMG_iTargetPriority);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleHead = Config::i(g_Variables.m_Ragebot.m_LMG_iMaxPointscaleHead);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleBody = Config::i(g_Variables.m_Ragebot.m_LMG_iMaxPointscaleBody);
+		break;
+	case AR:
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iHitchance = Config::i(g_Variables.m_Ragebot.m_AR_iHitchance);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamage = Config::i(g_Variables.m_Ragebot.m_AR_iMinDamage);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamageOverride = Config::i(g_Variables.m_Ragebot.m_AR_iMinDamageOverride);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_Hitboxes = Config::vhb<MenuRageHitbox_t>(g_Variables.m_Ragebot.m_AR_vecHitBoxes);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iTargettingType = Config::i(g_Variables.m_Ragebot.m_AR_iTargetPriority);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleHead = Config::i(g_Variables.m_Ragebot.m_AR_iMaxPointscaleHead);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleBody = Config::i(g_Variables.m_Ragebot.m_AR_iMaxPointscaleBody);
+		break;
+	case SHOTGUN:
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iHitchance = Config::i(g_Variables.m_Ragebot.m_SHOTGUN_iHitchance);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamage = Config::i(g_Variables.m_Ragebot.m_SHOTGUN_iMinDamage);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamageOverride = Config::i(g_Variables.m_Ragebot.m_SHOTGUN_iMinDamageOverride);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_Hitboxes = Config::vhb<MenuRageHitbox_t>(g_Variables.m_Ragebot.m_SHOTGUN_vecHitBoxes);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iTargettingType = Config::i(g_Variables.m_Ragebot.m_SHOTGUN_iTargetPriority);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleHead = Config::i(g_Variables.m_Ragebot.m_SHOTGUN_iMaxPointscaleHead);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleBody = Config::i(g_Variables.m_Ragebot.m_SHOTGUN_iMaxPointscaleBody);
+		break;
+	case SCOUT:
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iHitchance = Config::i(g_Variables.m_Ragebot.m_SCOUT_iHitchance);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamage = Config::i(g_Variables.m_Ragebot.m_SCOUT_iMinDamage);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamageOverride = Config::i(g_Variables.m_Ragebot.m_SCOUT_iMinDamageOverride);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_Hitboxes = Config::vhb<MenuRageHitbox_t>(g_Variables.m_Ragebot.m_SCOUT_vecHitBoxes);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iTargettingType = Config::i(g_Variables.m_Ragebot.m_SCOUT_iTargetPriority);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleHead = Config::i(g_Variables.m_Ragebot.m_SCOUT_iMaxPointscaleHead);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleBody = Config::i(g_Variables.m_Ragebot.m_SCOUT_iMaxPointscaleBody);
+		break;
+	case AUTOSNIPER:
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iHitchance = Config::i(g_Variables.m_Ragebot.m_AUTOSNIPER_iHitchance);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamage = Config::i(g_Variables.m_Ragebot.m_AUTOSNIPER_iMinDamage);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamageOverride = Config::i(g_Variables.m_Ragebot.m_AUTOSNIPER_iMinDamageOverride);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_Hitboxes = Config::vhb<MenuRageHitbox_t>(g_Variables.m_Ragebot.m_AUTOSNIPER_vecHitBoxes);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iTargettingType = Config::i(g_Variables.m_Ragebot.m_AUTOSNIPER_iTargetPriority);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleHead = Config::i(g_Variables.m_Ragebot.m_AUTOSNIPER_iMaxPointscaleHead);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleBody = Config::i(g_Variables.m_Ragebot.m_AUTOSNIPER_iMaxPointscaleBody);
+		break;
+	case AWP:
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iHitchance = Config::i(g_Variables.m_Ragebot.m_AWP_iHitchance);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamage = Config::i(g_Variables.m_Ragebot.m_AWP_iMinDamage);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMinDamageOverride = Config::i(g_Variables.m_Ragebot.m_AWP_iMinDamageOverride);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_Hitboxes = Config::vhb<MenuRageHitbox_t>(g_Variables.m_Ragebot.m_AWP_vecHitBoxes);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iTargettingType = Config::i(g_Variables.m_Ragebot.m_AWP_iTargetPriority);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleHead = Config::i(g_Variables.m_Ragebot.m_AWP_iMaxPointscaleHead);
+		g_Variables.m_Ragebot.m_ActiveConfig.m_iMaxPointscaleBody = Config::i(g_Variables.m_Ragebot.m_AWP_iMaxPointscaleBody);
+		break;
+	}
+	this->m_bBadWeapon = false;
+	return true;
+}
+
+
+void CRage::OverrideInputHistory()
+{
+	if (!this->m_Data.m_LastTarget.HasValidTarget())
+		return;
+
+	for (int i = 0; i < Globals::m_pCmd->m_csgoUserCmd.input_history_size(); i++)
+	{
+		CSGOInputHistoryEntryPB* pInputEntry = Globals::m_pCmd->m_csgoUserCmd.mutable_input_history(i);
+		if (!pInputEntry)
+			continue;
+
+		pInputEntry->set_player_tick_count(Globals::m_pLocalPlayerController->m_nTickBase());
+		pInputEntry->set_render_tick_count(this->m_Data.m_LastTarget.m_pLagRecord->m_nTick + g_LagCompensation->m_InterpolationTiming.m_iTick);
+
+		pInputEntry->set_player_tick_fraction(0.f);
+		pInputEntry->set_render_tick_fraction(0.f);
+
+		if (pInputEntry->has_cl_interp())
+			pInputEntry->mutable_cl_interp()->set_frac(0.f);
+
+		if (pInputEntry->has_sv_interp0()) {
+			pInputEntry->mutable_sv_interp0()->set_frac(0.f);
+			pInputEntry->mutable_sv_interp0()->set_src_tick(0);
+			pInputEntry->mutable_sv_interp0()->set_dst_tick(0);
+		}
+
+		if (pInputEntry->has_sv_interp1()) {
+			pInputEntry->mutable_sv_interp1()->set_frac(0.f);
+			pInputEntry->mutable_sv_interp1()->set_src_tick(0);
+			pInputEntry->mutable_sv_interp1()->set_dst_tick(0);
+		}
+
+		pInputEntry->mutable_view_angles()->set_x(this->m_Data.m_LastTarget.m_angToTarget.x);
+		pInputEntry->mutable_view_angles()->set_y(this->m_Data.m_LastTarget.m_angToTarget.y);
+
+	}
+}
+
+void CRage::ConsiderAttack()
+{
+	if (!this->m_Data.m_LastTarget.HasValidTarget())
+		return;
+
+	// Check if auto fire is enabled
+	bool bAutoFireEnabled = Config::b(g_Variables.m_Ragebot.m_bAutoShoot);
+	
+	// Duck Peek теперь просто приседание, не влияет на стрельбу
+	bool bCanShoot = bAutoFireEnabled;
+	
+	// Check if we should force shot based on low inaccuracy
+	//bool bShouldForceShot = g_Accuracy->ShouldForceShot();
+
+//#ifdef DEBUG_CONSOLE
+//	if (bShouldForceShot) {
+//		Logging::Print(X("[Ragebot] Force shot active - inaccuracy is low enough"));
+//	}
+//#endif
+
+	// Only proceed if auto fire is enabled and weapon is accurate
+	if (!bCanShoot)
+		return;
+		
+	if (!this->m_Data.m_bIsAccurate)
+		return;
+
+	// Проверяем состояние игрока
+	bool bPlayerInAir = !(Globals::m_pLocalPlayerPawn->m_fFlags() & FL_ONGROUND);
+	bool bAutostopEnabled = Config::b(g_Variables.m_Ragebot.m_bAutostop);
+	
+	// Обычная логика для воздуха и земли
+	if (bPlayerInAir) {
+		// Используем проверку точности оружия для воздушной стрельбы
+		bool bWeaponAccurate = IsWeaponAccurate();
+		
+		// В воздухе стреляем если оружие точное ИЛИ если скорость не слишком высокая
+		if (!bWeaponAccurate) {
+			float flCurrentSpeed = Globals::m_pLocalPlayerPawn->m_vecAbsVelocity().Length2D();
+			float flMaxSpeed = LocalPlayerData::m_pWeapon->GetMaxSpeed();
+			
+			// В воздухе разрешаем стрельбу при более высокой скорости
+			if (flCurrentSpeed > flMaxSpeed * 0.8f) // 80% от максимальной скорости
+				return;
+		}
+		// Если оружие точное или скорость приемлемая - продолжаем к стрельбе
+	}
+	
+	// На земле - используем автостопы
+	else if (bAutostopEnabled)
+	{
+		float flCurrentSpeed = Globals::m_pLocalPlayerPawn->m_vecAbsVelocity().Length2D();
+		float flMaxSpeed = LocalPlayerData::m_pWeapon->GetMaxSpeed();
+		
+		// Используем проверку точности оружия (как в форсшуте)
+		bool bWeaponAccurate = IsWeaponAccurate();
+		
+		// Если оружие уже точное - можем стрелять
+		if (bWeaponAccurate) {
+			// Оружие достаточно точное, продолжаем к стрельбе
+		}
+		else {
+			// Если оружие не точное - проверяем скорость (только на земле)
+			float flShootThreshold = flMaxSpeed * 0.20f;
+			
+			// Стреляем только если скорость достаточно низкая
+			if (flCurrentSpeed > flShootThreshold)
+				return;
+		}
+	}
+
+	if (Config::b(g_Variables.m_Ragebot.m_bDoubleTap))
+	{
+		Doubletap::Execute();
+	}
+
+	auto& pCmd = Globals::m_pCmd;
+
+	// Автоскоп теперь в OnCreateMove, здесь только проверяем что мы в зуме перед выстрелом
+	if (Config::b(g_Variables.m_Ragebot.m_bAutoscope))
+	{
+		if (LocalPlayerData::m_pWeapon && LocalPlayerData::m_pWeaponBaseVData)
+		{
+			bool bIsSniperRifle = (LocalPlayerData::m_pWeaponBaseVData->m_WeaponType() == WEAPONTYPE_SNIPER_RIFLE);
+			bool bIsScoped = Globals::m_pLocalPlayerPawn->m_bIsScoped();
+			
+			// Если снайперская винтовка и не в зуме - не стреляем, ждем зума (кроме Duck Peek)
+			if (bIsSniperRifle && !bIsScoped && !m_bDuckPeekActive)
+				return;
+		}
+	}
+
+	if (!(Interfaces::m_pInput->nKeyboardPressed & IN_ATTACK))
+		Interfaces::m_pInput->nKeyboardPressed |= IN_ATTACK;
+
+	if (!(pCmd->m_nButtons.m_nValue & IN_ATTACK))
+		pCmd->m_nButtons.m_nValue |= IN_ATTACK;
+
+	// Регистрируем выстрел для логов промахов
+	if (this->m_Data.m_LastTarget.HasValidTarget() && this->m_Data.m_LastTarget.m_pLagRecord)
+	{
+		std::string weaponName = LocalPlayerData::m_pWeapon ? "weapon" : "unknown";
+		g_ShotHandler->RegisterShot(
+			m_vShootPos,
+			this->m_Data.m_LastTarget.m_vPoint,
+			this->m_Data.m_LastTarget.m_angToTarget,
+			this->m_Data.m_LastTarget.m_pLagRecord->m_pPawn,
+			this->m_Data.m_LastTarget.m_hitboxData.m_nHitboxIndex,
+			this->m_Data.m_LastTarget.m_flDamage,
+			weaponName
+		);
+	}
+
+	Globals::m_pCmd->m_csgoUserCmd.mutable_base()->set_client_tick(Globals::m_pLocalPlayerController->m_nTickBase());
+
+	int nEntryIdx = pCmd->m_csgoUserCmd.input_history_size() - 1;
+	pCmd->m_csgoUserCmd.set_attack1_start_history_index(nEntryIdx);
+
+
+
+	if (this->m_Data.m_bShouldInvalidateAngle)
+	{
+		pCmd->m_csgoUserCmd.mutable_base()->mutable_viewangles()->set_x(179.f);
+		pCmd->m_csgoUserCmd.mutable_base()->mutable_viewangles()->set_y(std::remainder(this->m_Data.m_LastTarget.m_angToTarget.y + 180.f, 360.f));
+
+		g_Movement->StoreModelAngles();
+	}
+
+	if (!Config::b(g_Variables.m_Ragebot.m_bSilentAim))
+	{
+		Interfaces::m_pInput->SetViewAngle(this->m_Data.m_LastTarget.m_angToTarget);
+	}
+}
+void CRage::AutoRevolver() {
+	if (!Globals::m_pLocalPlayerPawn || !Globals::m_pCmd)
+		return;
+
+	if (!Config::b(g_Variables.m_Ragebot.m_bAutoRevolver))
+		return;
+
+	CPlayer_WeaponServices* pWeaponServices = Globals::m_pLocalPlayerPawn->m_pWeaponServices();
+	if (!pWeaponServices)
+		return;
+
+	CCSPlayer_WeaponServices* pPlayerWeaponServices = static_cast<CCSPlayer_WeaponServices*>(Globals::m_pLocalPlayerPawn->m_pWeaponServices());
+	if (!pPlayerWeaponServices)
+		return;
+
+	C_CSWeaponBase* m_pWeapon = pWeaponServices->m_hActiveWeapon().Get();
+	if (!m_pWeapon)
+		return;
+
+	C_EconItemView* item = m_pWeapon->m_AttributeManager()->m_Item();
+	if (!item)
+		return;
+
+	if (item->m_iItemDefinitionIndex() != WEAPON_R8_REVOLVER)
+		return;
+
+	auto time = TICKS_TO_TIME(Globals::m_pLocalPlayerController->m_nTickBase() + 1);
+
+	if (time >= pPlayerWeaponServices->m_flNextAttack()) {
+		auto secondTick = time >= TICKS_TO_TIME(m_pWeapon->m_nNextPrimaryAttackTick()) && time > TICKS_TO_TIME(m_pWeapon->m_nPostponeFireReadyTicks());
+
+		if (secondTick && time < TICKS_TO_TIME(m_pWeapon->m_nNextSecondaryAttackTick()))
+			Globals::m_pCmd->m_nButtons.m_nValue |= IN_ATTACK2;
+		else if (!secondTick)
+			Globals::m_pCmd->m_nButtons.m_nValue |= IN_ATTACK;
+	}
+
+	if (!m_pWeapon->m_iClip1() && m_pWeapon->m_pReserveAmmo() > 0) {
+		Globals::m_pCmd->m_nButtons.m_nValue &= ~IN_ATTACK;
+		Globals::m_pCmd->m_nButtons.m_nValue |= IN_RELOAD;
+	}
+}
+
+void CRage::OnCreateMove()
+{
+	if (!Config::b(g_Variables.m_Ragebot.m_bRagebotEnabled) || this->m_bBadWeapon)
+	{
+		this->m_Data = {};
+		return;
+	}
+
+	AutoRevolver();
+
+	// Обрабатываем кейбинды в начале
+	HandleKeybinds();
+
+	if (Globals::m_pCmd->m_nCommandNumber == g_Scan->m_nLastSequenceScan)
+		return;
+
+	// Оптимизация: ограничиваем частоту полного сканирования для лучшей производительности
+	static int nLastFullScan = 0;
+	bool bShouldDoFullScan = (Globals::m_pCmd->m_nCommandNumber - nLastFullScan) >= 2; // Полное сканирование каждые 2 тика
+	
+	if (!bShouldDoFullScan && this->m_Data.m_LastTarget.HasValidTarget()) {
+		// Используем предыдущую цель если она все еще валидна
+		return;
+	}
+	
+	if (bShouldDoFullScan) {
+		nLastFullScan = Globals::m_pCmd->m_nCommandNumber;
+	}
+
+	g_Scan->m_nLastSequenceScan = Globals::m_pCmd->m_nCommandNumber;
+
+	if (!Input::HandleInput(Config::kb(g_Variables.m_Ragebot.m_iMinDamageOverrideKey))) {
+		m_bForceHeadshot = false;
+	}
+
+	if (LocalPlayerData::m_pWeapon->m_nNextPrimaryAttackTick() > Interfaces::m_pGlobalVariables->m_nTickCount)
+	{
+		this->m_Data = {};
+		return;
+	}
+
+	// Сначала получаем цель, чтобы проверить её перед экстраполяцией
+	this->m_Data.m_LastTarget = g_Scan->GetBestTarget();
+
+	// Duck Peek - простое приседание по кнопке
+	if (m_bDuckPeekActive) {
+		// Просто приседаем пока кнопка нажата
+		Globals::m_pCmd->m_nButtons.SetButtonState(IN_DUCK, CInButtonState::IN_BUTTON_DOWN);
+		
+#ifdef DEBUG_CONSOLE
+		static int nLastDebugTick = 0;
+		if (Globals::m_pCmd->m_nCommandNumber - nLastDebugTick > 64) {
+			Logging::Print(X("[Duck Peek] Crouching"));
+			nLastDebugTick = Globals::m_pCmd->m_nCommandNumber;
+		}
+#endif
+	}
+
+	// Автоскоп: зумимся один раз когда появляется цель
+	if (Config::b(g_Variables.m_Ragebot.m_bAutoscope))
+	{
+		if (LocalPlayerData::m_pWeapon && LocalPlayerData::m_pWeaponBaseVData)
+		{
+			bool bIsSniperRifle = (LocalPlayerData::m_pWeaponBaseVData->m_WeaponType() == WEAPONTYPE_SNIPER_RIFLE);
+			bool bIsScoped = Globals::m_pLocalPlayerPawn->m_bIsScoped();
+			bool bHasTarget = this->m_Data.m_LastTarget.HasValidTarget();
+			
+			// Сбрасываем флаг если нет цели или уже в зуме
+			if (!bHasTarget || bIsScoped)
+			{
+				m_bAutoscopePressed = false;
+			}
+			
+			// Если есть цель, снайперская винтовка, не в зуме и еще не нажимали - нажимаем ОДИН РАЗ
+			if (bIsSniperRifle && !bIsScoped && bHasTarget && !m_bAutoscopePressed)
+			{
+				// Нажимаем кнопку IN_ATTACK2 ОДИН РАЗ
+				Globals::m_pCmd->m_nButtons.m_nValue |= IN_ATTACK2;
+				Interfaces::m_pInput->nKeyboardPressed |= IN_ATTACK2;
+				m_bAutoscopePressed = true; // Запоминаем что нажали
+			}
+		}
+	}
+
+	QAngle m_vecAimAngle;
+	Vector m_Delta = g_Rage->m_Data.m_LastTarget.m_vPoint - LocalPlayerData::m_vecEyePosition;
+	Math::VectorAngles(m_Delta, m_vecAimAngle);
+	m_vecAimAngle.z = 0;
+
+	if (!this->m_Data.m_LastTarget.HasValidTarget())
+	{
+		this->m_Data = {};
+		// Используем текущую позицию, если цели нет
+		m_vExtrapShootPos = m_vShootPos;
+		return;
+	}
+
+	this->m_Data.m_bIsAccurate = this->m_Data.m_LastTarget.m_pLagRecord->WithAppliedState(([&] { return g_Accuracy->IsAccurate(); }));
+	this->m_Data.m_bShouldInvalidateAngle = !this->m_Data.m_LastTarget.m_pLagRecord->WantsLagCompensationOnEntity(LocalPlayerData::m_vecAbsOrigin, g_Movement->m_angModelAngles);
+	
+	bool bAutostopEnabled = Config::b(g_Variables.m_Ragebot.m_bAutostop);
+	bool bPlayerInAir = !(Globals::m_pLocalPlayerPawn->m_fFlags() & FL_ONGROUND);
+	float flCurrentSpeed = Globals::m_pLocalPlayerPawn->m_vecAbsVelocity().Length2D();
+	float flMaxSpeed = LocalPlayerData::m_pWeapon->GetMaxSpeed();
+
+	// Экстраполяция работает и на земле и в воздухе, но с разной логикой
+	bool bShouldExtrap = (bAutostopEnabled || m_bDuckPeekActive) && this->m_Data.m_LastTarget.HasValidTarget();
+	m_vExtrapShootPos = bShouldExtrap ? g_Movement->SimulatePosAtStop(m_vShootPos) : m_vShootPos;
+
+	// Автостоп работает и в воздухе и на земле, но с разными порогами
+	float flMinSpeedThreshold, flStopThreshold;
+	
+	// Проверяем точность оружия для более умного автостопа
+	bool bWeaponAccurate = IsWeaponAccurate();
+	
+	if (bPlayerInAir) {
+		// В воздухе используем более низкие пороги для воздушных страфов
+		flMinSpeedThreshold = flMaxSpeed * 0.15f;
+		flStopThreshold = flMaxSpeed * 0.08f;
+	} else {
+		// На земле используем обычные пороги
+		flMinSpeedThreshold = flMaxSpeed * 0.25f;
+		flStopThreshold = flMaxSpeed * 0.12f;
+	}
+	
+	// Если оружие уже точное - снижаем пороги для более быстрой стрельбы
+	if (bWeaponAccurate) {
+		flMinSpeedThreshold *= 0.7f; // Уменьшаем пороги на 30%
+		flStopThreshold *= 0.7f;
+	}
+	
+	// Duck Peek теперь не влияет на автостоп - просто приседание
+	this->m_Data.m_bWants2DMoveHalt = bAutostopEnabled && this->m_Data.m_LastTarget.HasValidTarget() 
+		&& flCurrentSpeed > flMinSpeedThreshold && flCurrentSpeed > flStopThreshold;
+
+#ifdef DEBUG_CONSOLE
+	if (this->m_Data.m_bIsAccurate) {
+		Logging::Print(X("[Ragebot] OnCreateMove: Target is accurate, damage: {}"), this->m_Data.m_LastTarget.m_flDamage);
+	}
+	else {
+		Logging::Print(X("[Ragebot] OnCreateMove: Target is not accurate"));
+	}
+#endif
+}
